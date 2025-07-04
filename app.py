@@ -3,14 +3,39 @@ from flask import Flask, request, jsonify, g
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import time
-import jwt # Import the PyJWT library
-from datetime import datetime, timedelta # For setting JWT expiration
+import jwt
+from datetime import datetime, timedelta
+import json
+import threading # For locking JSON file operations
 
 app = Flask(__name__)
 app.config['DATABASE'] = 'location_sharing.db'
 app.config['SECRET_KEY'] = os.urandom(24) # Used for session management, but JWT will handle auth
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'super-secret-jwt-key-please-change-in-production') # IMPORTANT: Use a strong, unique key in production
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30) # Token valid for 30 days
+
+# --- JSON Config File Setup ---
+CONFIG_FILE_PATH = 'user_group_config.json'
+config_lock = threading.Lock() # To prevent race conditions when writing to JSON
+
+def load_config():
+    """Loads the user and group configuration from the JSON file."""
+    with config_lock:
+        if not os.path.exists(CONFIG_FILE_PATH):
+            # Create an empty config file if it doesn't exist
+            initial_config = {"users": [], "groups": []}
+            with open(CONFIG_FILE_PATH, 'w') as f:
+                json.dump(initial_config, f, indent=4)
+            return initial_config
+        
+        with open(CONFIG_FILE_PATH, 'r') as f:
+            return json.load(f)
+
+def save_config(config_data):
+    """Saves the user and group configuration to the JSON file."""
+    with config_lock:
+        with open(CONFIG_FILE_PATH, 'w') as f:
+            json.dump(config_data, f, indent=4)
 
 # --- Database Setup ---
 def get_db():
@@ -29,7 +54,7 @@ def close_connection(exception):
         db.close()
 
 def init_db():
-    """Initializes the database schema."""
+    """Initializes the database schema (only users and locations tables)."""
     with app.app_context():
         db = get_db()
         cursor = db.cursor()
@@ -52,36 +77,21 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
         ''')
-        # Create groups table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS groups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                owner_id INTEGER NOT NULL,
-                FOREIGN KEY (owner_id) REFERENCES users (id)
-            )
-        ''')
-        # Create group_members table (many-to-many relationship)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS group_members (
-                user_id INTEGER NOT NULL,
-                group_id INTEGER NOT NULL,
-                PRIMARY KEY (user_id, group_id),
-                FOREIGN KEY (user_id) REFERENCES users (id),
-                FOREIGN KEY (group_id) REFERENCES groups (id)
-            )
-        ''')
         db.commit()
     print("Database initialized.")
+    # Ensure config file exists on startup
+    load_config()
+    print(f"User/Group config file '{CONFIG_FILE_PATH}' initialized/loaded.")
+
 
 # --- Helper Functions for Authentication ---
 def get_user_by_username(username):
-    """Retrieves a user by username."""
+    """Retrieves a user by username from the SQLite DB."""
     db = get_db()
     return db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
 
 def get_user_by_id(user_id):
-    """Retrieves a user by ID."""
+    """Retrieves a user by ID from the SQLite DB."""
     db = get_db()
     return db.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
 
@@ -125,7 +135,10 @@ def login_required(f):
 
 @app.route('/register', methods=['POST'])
 def register():
-    """Registers a new user."""
+    """
+    Registers a new user in the SQLite database and adds them to the JSON config
+    with an empty list of groups.
+    """
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -142,11 +155,25 @@ def register():
         cursor = db.cursor()
         cursor.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)',
                        (username, password_hash))
+        new_user_id = cursor.lastrowid
         db.commit()
-        return jsonify({'message': 'User registered successfully'}), 201
+
+        # Add new user to JSON config with no groups initially
+        config = load_config()
+        config['users'].append({
+            "id": new_user_id,
+            "username": username,
+            "groups": [] # User is not part of any group by default
+        })
+        save_config(config)
+
+        return jsonify({'message': 'User registered successfully', 'user_id': new_user_id}), 201
     except sqlite3.Error as e:
         db.rollback()
         return jsonify({'message': f'Database error: {e}'}), 500
+    except Exception as e:
+        return jsonify({'message': f'Error updating config file: {e}'}), 500
+
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -194,160 +221,52 @@ def submit_location():
         db.rollback()
         return jsonify({'message': f'Database error: {e}'}), 500
 
-@app.route('/create_group', methods=['POST'])
-@login_required
-def create_group():
-    """Creates a new group."""
-    data = request.get_json()
-    group_name = data.get('name')
-    user_id = g.user_id
-
-    if not group_name:
-        return jsonify({'message': 'Group name is required'}), 400
-
-    db = get_db()
-    try:
-        cursor = db.cursor()
-        cursor.execute('INSERT INTO groups (name, owner_id) VALUES (?, ?)',
-                       (group_name, user_id))
-        group_id = cursor.lastrowid
-        # Automatically add the owner to the group
-        cursor.execute('INSERT INTO group_members (user_id, group_id) VALUES (?, ?)',
-                       (user_id, group_id))
-        db.commit()
-        return jsonify({'message': 'Group created successfully', 'group_id': group_id}), 201
-    except sqlite3.IntegrityError:
-        db.rollback()
-        return jsonify({'message': 'Group name already exists'}), 409
-    except sqlite3.Error as e:
-        db.rollback()
-        return jsonify({'message': f'Database error: {e}'}), 500
-
-@app.route('/join_group', methods=['POST'])
-@login_required
-def join_group():
-    """Allows a user to join an existing group."""
-    data = request.get_json()
-    group_id = data.get('group_id')
-    user_id = g.user_id
-
-    if not group_id:
-        return jsonify({'message': 'Group ID is required'}), 400
-
-    db = get_db()
-    try:
-        cursor = db.cursor()
-        # Check if group exists
-        group = db.execute('SELECT id FROM groups WHERE id = ?', (group_id,)).fetchone()
-        if not group:
-            return jsonify({'message': 'Group not found'}), 404
-
-        cursor.execute('INSERT INTO group_members (user_id, group_id) VALUES (?, ?)',
-                       (user_id, group_id))
-        db.commit()
-        return jsonify({'message': 'Joined group successfully'}), 200
-    except sqlite3.IntegrityError:
-        db.rollback()
-        return jsonify({'message': 'Already a member of this group'}), 409
-    except sqlite3.Error as e:
-        db.rollback()
-        return jsonify({'message': f'Database error: {e}'}), 500
-
-@app.route('/leave_group', methods=['POST'])
-@login_required
-def leave_group():
-    """Allows a user to leave a group."""
-    data = request.get_json()
-    group_id = data.get('group_id')
-    user_id = g.user_id
-
-    if not group_id:
-        return jsonify({'message': 'Group ID is required'}), 400
-
-    db = get_db()
-    try:
-        cursor = db.cursor()
-        cursor.execute('DELETE FROM group_members WHERE user_id = ? AND group_id = ?',
-                       (user_id, group_id))
-        if cursor.rowcount == 0:
-            return jsonify({'message': 'Not a member of this group or group not found'}), 404
-        db.commit()
-        return jsonify({'message': 'Left group successfully'}), 200
-    except sqlite3.Error as e:
-        db.rollback()
-        return jsonify({'message': f'Database error: {e}'}), 500
-
-@app.route('/my_groups', methods=['GET'])
-@login_required
-def my_groups():
-    """Retrieves all groups the authenticated user is a member of."""
-    user_id = g.user_id
-    db = get_db()
-    groups = db.execute('''
-        SELECT g.id, g.name, g.owner_id, u.username AS owner_username
-        FROM groups g
-        JOIN group_members gm ON g.id = gm.group_id
-        JOIN users u ON g.owner_id = u.id
-        WHERE gm.user_id = ?
-    ''', (user_id,)).fetchall()
-    
-    return jsonify([dict(group) for group in groups]), 200
-
-@app.route('/group_members/<int:group_id>', methods=['GET'])
-@login_required
-def get_group_members(group_id):
-    """Retrieves members of a specific group, if the user is part of that group."""
-    user_id = g.user_id
-    db = get_db()
-
-    # Check if the requesting user is a member of the group
-    is_member = db.execute('SELECT 1 FROM group_members WHERE user_id = ? AND group_id = ?',
-                           (user_id, group_id)).fetchone()
-    if not is_member:
-        return jsonify({'message': 'You are not a member of this group'}), 403
-
-    members = db.execute('''
-        SELECT u.id, u.username
-        FROM users u
-        JOIN group_members gm ON u.id = gm.user_id
-        WHERE gm.group_id = ?
-    ''', (group_id,)).fetchall()
-
-    return jsonify([dict(member) for member in members]), 200
-
 @app.route('/get_locations', methods=['POST'])
 @login_required
 def get_locations():
     """
-    Retrieves the latest location for users in specified groups that the
-    authenticated user is a member of.
+    Retrieves the latest location for users who share at least one common group
+    with the authenticated user, based on the JSON config file.
     """
-    data = request.get_json()
-    group_ids = data.get('group_ids', [])
-    user_id = g.user_id
+    requesting_user_id = g.user_id
     
-    if not group_ids:
-        return jsonify({'message': 'No group IDs provided'}), 400
+    config = load_config()
+    
+    requesting_user_groups = []
+    requesting_user_username = None
+    
+    # Find the requesting user's groups from the JSON config
+    for user_data in config['users']:
+        if user_data['id'] == requesting_user_id:
+            requesting_user_groups = user_data.get('groups', [])
+            requesting_user_username = user_data.get('username')
+            break
+            
+    if not requesting_user_groups:
+        return jsonify({'message': 'You are not part of any groups, so no locations can be shared.'}), 403
 
-    db = get_db()
     accessible_user_ids = set()
     
-    # Get all users from the requested groups that the current user is a member of
-    for group_id in group_ids:
-        # Verify the user is a member of the requested group
-        is_member = db.execute('SELECT 1 FROM group_members WHERE user_id = ? AND group_id = ?',
-                               (user_id, group_id)).fetchone()
-        if is_member:
-            group_members = db.execute('SELECT user_id FROM group_members WHERE group_id = ?',
-                                       (group_id,)).fetchall()
-            for member in group_members:
-                accessible_user_ids.add(member['user_id'])
-    
+    # Find all users who share at least one group with the requesting user
+    for other_user_data in config['users']:
+        # Don't include self unless explicitly desired (current logic includes self if in a group)
+        # If you want to exclude self: if other_user_data['id'] == requesting_user_id: continue
+        
+        other_user_groups = other_user_data.get('groups', [])
+        
+        # Check for common groups
+        common_groups = set(requesting_user_groups).intersection(set(other_user_groups))
+        
+        if common_groups:
+            accessible_user_ids.add(other_user_data['id'])
+            
     if not accessible_user_ids:
-        return jsonify({'message': 'No accessible users found in the specified groups'}), 403
+        return jsonify({'message': 'No accessible users found in your shared groups.'}), 403
 
-    # Fetch the latest location for each accessible user
+    db = get_db()
     locations = []
+    
+    # Fetch the latest location for each accessible user
     for target_user_id in accessible_user_ids:
         latest_location = db.execute('''
             SELECT l.latitude, l.longitude, l.timestamp, u.username
@@ -363,8 +282,16 @@ def get_locations():
             
     return jsonify(locations), 200
 
+# --- Removed Endpoints (as group management is now via JSON file) ---
+# @app.route('/create_group', methods=['POST'])
+# @app.route('/join_group', methods=['POST'])
+# @app.route('/leave_group', methods=['POST'])
+# @app.route('/my_groups', methods=['GET'])
+# @app.route('/group_members/<int:group_id>', methods=['GET'])
+
+
 # --- Run the App ---
 if __name__ == '__main__':
-    # Initialize the database when the script is run directly
+    # Initialize the database and config file when the script is run directly
     init_db()
     app.run(debug=True) # debug=True for development, turn off for production
