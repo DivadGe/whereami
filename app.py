@@ -38,6 +38,22 @@ def save_config(config_data):
             json.dump(config_data, f, indent=4)
 
 # --- Database Setup ---
+# Define get_db() first, as it's used by init_db()
+def get_db():
+    """Connects to the specific database."""
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(app.config['DATABASE'])
+        db.row_factory = sqlite3.Row # This makes rows behave like dictionaries
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    """Closes the database connection at the end of the request."""
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
 # Flag to ensure database initialization runs only once per application instance
 _db_initialized = threading.Event()
 
@@ -50,7 +66,7 @@ def init_db():
         return # Already initialized
 
     with app.app_context():
-        db = get_db()
+        db = get_db() # get_db() is now defined
         cursor = db.cursor()
         # Create users table
         cursor.execute('''
@@ -82,14 +98,6 @@ def init_db():
 # This ensures it runs once when Gunicorn loads the app
 with app.app_context():
     init_db()
-
-
-@app.teardown_appcontext
-def close_connection(exception):
-    """Closes the database connection at the end of the request."""
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
 
 
 # --- Helper Functions for Authentication ---
