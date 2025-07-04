@@ -38,23 +38,17 @@ def save_config(config_data):
             json.dump(config_data, f, indent=4)
 
 # --- Database Setup ---
-def get_db():
-    """Connects to the specific database."""
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(app.config['DATABASE'])
-        db.row_factory = sqlite3.Row # This makes rows behave like dictionaries
-    return db
-
-@app.teardown_appcontext
-def close_connection(exception):
-    """Closes the database connection at the end of the request."""
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
+# Flag to ensure database initialization runs only once per application instance
+_db_initialized = threading.Event()
 
 def init_db():
-    """Initializes the database schema (only users and locations tables)."""
+    """
+    Initializes the database schema (only users and locations tables).
+    Ensures it runs only once per application lifecycle.
+    """
+    if _db_initialized.is_set():
+        return # Already initialized
+
     with app.app_context():
         db = get_db()
         cursor = db.cursor()
@@ -82,6 +76,20 @@ def init_db():
     # Ensure config file exists on startup
     load_config()
     print(f"User/Group config file '{CONFIG_FILE_PATH}' initialized/loaded.")
+    _db_initialized.set() # Mark as initialized
+
+# Call init_db when the application context is first pushed
+# This ensures it runs once when Gunicorn loads the app
+with app.app_context():
+    init_db()
+
+
+@app.teardown_appcontext
+def close_connection(exception):
+    """Closes the database connection at the end of the request."""
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
 
 
 # --- Helper Functions for Authentication ---
@@ -292,6 +300,6 @@ def get_locations():
 
 # --- Run the App ---
 if __name__ == '__main__':
-    # Initialize the database and config file when the script is run directly
-    init_db()
+    # init_db() is now called directly when app context is pushed,
+    # so this block is primarily for running the Flask dev server.
     app.run(debug=True) # debug=True for development, turn off for production
