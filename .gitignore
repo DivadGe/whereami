@@ -1,0 +1,6 @@
+# .gitignore content
+*.pyc
+__pycache__/
+.env
+venv/
+location_sharing.db
